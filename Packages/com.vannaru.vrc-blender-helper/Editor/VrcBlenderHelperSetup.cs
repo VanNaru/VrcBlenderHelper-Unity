@@ -59,6 +59,7 @@ namespace VrcBlenderHelper
         {
             public string root_bone;
             public int transform_count;
+            public float endpoint_length;
             public PhysBoneSettings settings;
         }
 
@@ -214,6 +215,11 @@ namespace VrcBlenderHelper
                     report.Warnings.Add($"{ctx}: Polar limit -- Max Pitch and Max Yaw both set to {s.max_angle}; tune separately if needed.");
                 }
                 SetFloat(so, "radius", s.radius * LocalScaleFactor(root, bone), ctx, report);
+                // Blender bones have tails, Unity transforms don't: without an
+                // endpoint VRChat can't rotate the chain's last bones. Blender's
+                // FBX export keeps each bone's +Y axis along the bone.
+                SetVector3(so, "endpointPosition",
+                    new Vector3(0f, e.endpoint_length * LocalScaleFactor(root, bone), 0f), ctx, report);
                 SetEnum(so, "allowCollision", s.allow_collision, ctx, report);
                 SetEnum(so, "allowGrabbing", s.allow_grabbing, ctx, report);
                 SetEnum(so, "allowPosing", s.allow_posing, ctx, report);

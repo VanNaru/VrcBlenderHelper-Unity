@@ -1,7 +1,7 @@
 {
   "name": "com.vannaru.vrc-blender-helper",
   "displayName": "VRC Blender Helper",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "unity": "2022.3",
   "description": "Applies the PhysBones, Contacts and View Position authored with the VRC Avatar & World Helper Blender add-on to your avatar: Tools > VRC Blender Helper > Apply Setup to Selected Avatar.",
   "license": "GPL-3.0-or-later",
