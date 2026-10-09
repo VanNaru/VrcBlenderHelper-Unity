@@ -1,15 +1,21 @@
 // Companion to the "VRC Avatar & World Helper" Blender add-on.
 //
 // Reads the <name>.vrchelper.json sidecar that the add-on's "Export for
-// VRChat" button writes next to the FBX, and applies it to an avatar in the
-// scene: VRCPhysBone components on marked chain roots, VRCContactSender /
-// VRCContactReceiver components on Contact_* objects, and the Avatar
-// Descriptor's View Position.
+// VRChat" button writes next to the FBX, and applies it to a GameObject in
+// the scene. Two sidecar shapes exist (same suffix, distinguished by the
+// "format" field):
+//   - Avatar ("vrc_blender_helper_setup"): VRCPhysBone components on marked
+//     chain roots, VRCContactSender/VRCContactReceiver components on
+//     Contact_* objects, and the Avatar Descriptor's View Position.
+//   - World ("vrc_blender_helper_world_setup"): the scene's VRC Scene
+//     Descriptor's Spawns array, a Light Probe Group built from LightProbe_*
+//     marker positions, and VRCStation components on Station_* objects.
 //
 // Install: add the VPM listing in ALCOM/VCC and install "VRC Blender Helper"
 //          (see README), or copy this file into any "Editor" folder under Assets/.
-// Use:     select the avatar root in the Hierarchy, then
-//          Tools > VRC Blender Helper > Apply Setup to Selected Avatar.
+// Use:     select the avatar (or imported world) root in the Hierarchy, then
+//          Tools > VRC Blender Helper > Apply Setup to Selected Avatar, or
+//          Tools > VRC Blender Helper > Apply Setup to Selected World Root.
 //
 // Re-running is safe: existing components on the same objects are updated
 // in place, not duplicated, and everything is undoable as one step.
@@ -17,7 +23,16 @@
 // SDK types and fields are resolved by name (reflection + SerializedObject)
 // rather than referenced directly, so this file compiles in projects without
 // the VRChat SDK and degrades to warnings, not compile errors, if a future
-// SDK renames a field. Names verified against VRChat SDK 3.10.4.
+// SDK renames a field. Avatar-side field names (PhysBone, Contacts, Avatar
+// Descriptor) were verified against VRChat SDK 3.10.4. The world-side field
+// names below (VRCSceneDescriptor.spawns, VRCStation's settings) were NOT
+// verified against an installed Worlds SDK in the same way -- no SDK was
+// available to inspect while writing this. VRCSceneDescriptor.spawns is
+// fairly well-attested in community Udon references; VRCStation's field
+// names are a best-effort guess. If Apply World Setup logs "SDK field 'x'
+// not found" warnings, open the real VRCStation/VRCSceneDescriptor component
+// in the Inspector's Debug view to find the correct serialized name and fix
+// the SetXxx(...) calls in ApplyStations/ApplySpawns below.
 
 using System;
 using System.Collections.Generic;
@@ -30,15 +45,20 @@ namespace VrcBlenderHelper
 {
     public static class VrcBlenderHelperSetup
     {
-        const string MenuPath = "Tools/VRC Blender Helper/Apply Setup to Selected Avatar";
+        const string AvatarMenuPath = "Tools/VRC Blender Helper/Apply Setup to Selected Avatar";
+        const string WorldMenuPath = "Tools/VRC Blender Helper/Apply Setup to Selected World Root";
         const string SidecarSuffix = ".vrchelper.json";
         const string SetupFormat = "vrc_blender_helper_setup";
+        const string WorldSetupFormat = "vrc_blender_helper_world_setup";
         const int SupportedFormatVersion = 1;
+        const int SupportedWorldFormatVersion = 1;
 
         const string PhysBoneType = "VRC.SDK3.Dynamics.PhysBone.Components.VRCPhysBone";
         const string ContactSenderType = "VRC.SDK3.Dynamics.Contact.Components.VRCContactSender";
         const string ContactReceiverType = "VRC.SDK3.Dynamics.Contact.Components.VRCContactReceiver";
         const string AvatarDescriptorType = "VRC.SDK3.Avatars.Components.VRCAvatarDescriptor";
+        const string SceneDescriptorType = "VRC.SDK3.Components.VRCSceneDescriptor";
+        const string StationType = "VRC.SDK3.Components.VRCStation";
 
         // -- JSON shape (field names must match core/unity_bridge.py) --
 
@@ -97,6 +117,27 @@ namespace VrcBlenderHelper
             public ViewPositionEntry view_position;
         }
 
+        [Serializable]
+        class StationEntry
+        {
+            public string @object;
+            public bool seated;
+            public string player_mobility;
+            public bool disable_exit_collider;
+            public bool can_use_from_station;
+        }
+
+        [Serializable]
+        class WorldSetup
+        {
+            public string format;
+            public int format_version;
+            public string blender_version;
+            public string[] spawns;
+            public string[] light_probes;
+            public StationEntry[] stations;
+        }
+
         public class Report
         {
             public readonly List<string> Applied = new List<string>();
@@ -106,11 +147,19 @@ namespace VrcBlenderHelper
 
         // -- Menu entry --
 
-        [MenuItem(MenuPath, true)]
-        static bool ValidateMenu() => Selection.activeGameObject != null;
+        [MenuItem(AvatarMenuPath, true)]
+        static bool ValidateAvatarMenu() => Selection.activeGameObject != null;
 
-        [MenuItem(MenuPath)]
-        static void RunMenu()
+        [MenuItem(AvatarMenuPath)]
+        static void RunAvatarMenu() => RunMenu(Apply);
+
+        [MenuItem(WorldMenuPath, true)]
+        static bool ValidateWorldMenu() => Selection.activeGameObject != null;
+
+        [MenuItem(WorldMenuPath)]
+        static void RunWorldMenu() => RunMenu(ApplyWorld);
+
+        static void RunMenu(Func<GameObject, string, Report> applyFn)
         {
             var root = Selection.activeGameObject;
             var jsonPath = FindSidecar(root);
@@ -120,7 +169,7 @@ namespace VrcBlenderHelper
                 if (string.IsNullOrEmpty(jsonPath)) return;
             }
 
-            var report = Apply(root, jsonPath);
+            var report = applyFn(root, jsonPath);
             foreach (var line in report.Applied) Debug.Log("[VRC Blender Helper] " + line, root);
             foreach (var line in report.Warnings) Debug.LogWarning("[VRC Blender Helper] " + line, root);
             foreach (var line in report.Errors) Debug.LogError("[VRC Blender Helper] " + line, root);
@@ -301,6 +350,157 @@ namespace VrcBlenderHelper
             SetVector3(so, "ViewPosition", viewPosition, "Avatar Descriptor", report);
             so.ApplyModifiedProperties();
             report.Applied.Add($"View Position set to {viewPosition.ToString("F4")} ({vp.method})");
+        }
+
+        // -- Apply (world) --
+
+        /// <summary>
+        /// Applies a world sidecar: Spawns onto the scene's VRC Scene
+        /// Descriptor, a Light Probe Group from LightProbe_* marker
+        /// positions, and VRCStation settings on Station_* objects.
+        /// `worldRoot` is the GameObject the imported world FBX lives
+        /// under (where Spawn_NN/Station_NN/LightProbe_NN are found by
+        /// name) -- it does not need a Scene Descriptor on it itself,
+        /// since that component is typically placed separately in the
+        /// scene.
+        /// </summary>
+        public static Report ApplyWorld(GameObject worldRoot, string jsonPath)
+        {
+            var report = new Report();
+            WorldSetup setup;
+            try
+            {
+                setup = JsonUtility.FromJson<WorldSetup>(File.ReadAllText(jsonPath));
+            }
+            catch (Exception e)
+            {
+                report.Errors.Add($"Could not read {jsonPath}: {e.Message}");
+                return report;
+            }
+            if (setup == null || setup.format != WorldSetupFormat)
+            {
+                report.Errors.Add($"{Path.GetFileName(jsonPath)} is not a VRC Blender Helper world setup file.");
+                return report;
+            }
+            if (setup.format_version > SupportedWorldFormatVersion)
+                report.Warnings.Add($"World setup format v{setup.format_version} is newer than this script (v{SupportedWorldFormatVersion}) -- update the Unity script.");
+
+            Undo.SetCurrentGroupName("Apply VRC Blender Helper World Setup");
+            int undoGroup = Undo.GetCurrentGroup();
+
+            var root = worldRoot.transform;
+            ApplySpawns(root, setup.spawns, report);
+            ApplyLightProbes(root, setup.light_probes, report);
+            ApplyStations(root, setup.stations, report);
+
+            Undo.CollapseUndoOperations(undoGroup);
+            return report;
+        }
+
+        static void ApplySpawns(Transform importRoot, string[] spawnNames, Report report)
+        {
+            if (spawnNames == null || spawnNames.Length == 0) return;
+            var descriptorType = FindType(SceneDescriptorType);
+            var descriptor = descriptorType != null
+                ? UnityEngine.Object.FindObjectOfType(descriptorType) as Component
+                : null;
+            if (descriptor == null)
+            {
+                report.Warnings.Add("No VRC Scene Descriptor found in the scene -- add one and re-run to set Spawns.");
+                return;
+            }
+
+            var transforms = new List<Transform>();
+            foreach (var name in spawnNames)
+            {
+                var t = FindUnique(importRoot, name, null, report);
+                if (t != null) transforms.Add(t);
+            }
+            if (transforms.Count == 0) return;
+
+            var so = new SerializedObject(descriptor);
+            var p = Prop(so, "spawns", "Scene Descriptor", report);
+            if (p == null) return;
+            p.arraySize = transforms.Count;
+            for (int i = 0; i < transforms.Count; i++)
+                p.GetArrayElementAtIndex(i).objectReferenceValue = transforms[i];
+            so.ApplyModifiedProperties();
+            report.Applied.Add($"Scene Descriptor: {transforms.Count} spawn(s) set");
+        }
+
+        /// <summary>
+        /// LightProbeGroup is a core UnityEngine type (always present,
+        /// unlike the VRC SDK types above), so it's referenced directly
+        /// rather than through FindType/SerializedObject reflection.
+        /// Positions are stored on a dedicated "Light Probes" child of
+        /// `importRoot` (created if missing) so re-running updates the
+        /// same group instead of creating a new one each time.
+        /// </summary>
+        static void ApplyLightProbes(Transform importRoot, string[] probeNames, Report report)
+        {
+            if (probeNames == null || probeNames.Length == 0) return;
+
+            const string holderName = "Light Probes";
+            var holderTransform = importRoot.Find(holderName);
+            GameObject holderGo;
+            if (holderTransform == null)
+            {
+                holderGo = new GameObject(holderName);
+                Undo.RegisterCreatedObjectUndo(holderGo, "Create Light Probes holder");
+                Undo.SetTransformParent(holderGo.transform, importRoot, "Parent Light Probes holder");
+                holderGo.transform.localPosition = Vector3.zero;
+                holderGo.transform.localRotation = Quaternion.identity;
+                holderGo.transform.localScale = Vector3.one;
+            }
+            else
+            {
+                holderGo = holderTransform.gameObject;
+            }
+
+            var positions = new List<Vector3>();
+            foreach (var name in probeNames)
+            {
+                var t = FindUnique(importRoot, name, null, report);
+                if (t != null) positions.Add(holderGo.transform.InverseTransformPoint(t.position));
+            }
+            if (positions.Count == 0) return;
+
+            var group = holderGo.GetComponent<LightProbeGroup>();
+            bool added = group == null;
+            if (added) group = Undo.AddComponent<LightProbeGroup>(holderGo);
+            Undo.RecordObject(group, "Set Light Probe positions");
+            group.probePositions = positions.ToArray();
+
+            report.Applied.Add(
+                $"Light Probe Group: {(added ? "added" : "updated")} with {positions.Count} probe position(s) on '{holderName}'");
+        }
+
+        static void ApplyStations(Transform importRoot, StationEntry[] entries, Report report)
+        {
+            if (entries == null || entries.Length == 0) return;
+            var stationType = FindType(StationType);
+            if (stationType == null)
+            {
+                report.Errors.Add("VRCStation type not found -- is the VRChat Worlds SDK installed?");
+                return;
+            }
+
+            foreach (var e in entries)
+            {
+                var target = FindUnique(importRoot, e.@object, null, report);
+                if (target == null) continue;
+                var component = GetOrAdd(target.gameObject, stationType, out bool added);
+                var so = new SerializedObject(component);
+                var ctx = $"Station '{e.@object}'";
+
+                SetBool(so, "seated", e.seated, ctx, report);
+                SetEnum(so, "playerMobility", e.player_mobility, ctx, report);
+                SetBool(so, "disableStationExitCollider", e.disable_exit_collider, ctx, report);
+                SetBool(so, "canUseStationFromStation", e.can_use_from_station, ctx, report);
+                so.ApplyModifiedProperties();
+
+                report.Applied.Add($"{ctx}: {(added ? "added" : "updated")} VRCStation");
+            }
         }
 
         // -- Helpers --
