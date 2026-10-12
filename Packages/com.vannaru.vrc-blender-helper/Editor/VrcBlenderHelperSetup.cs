@@ -6,7 +6,10 @@
 // "format" field):
 //   - Avatar ("vrc_blender_helper_setup"): VRCPhysBone components on marked
 //     chain roots, VRCContactSender/VRCContactReceiver components on
-//     Contact_* objects, and the Avatar Descriptor's View Position.
+//     Contact_* objects, the Avatar Descriptor's View Position, and -- for
+//     any Contact Receiver linked to a shape key in Blender -- a generated
+//     AnimationClip wired to that Receiver's parameter via Motion Time on
+//     the FX Animator layer (see ApplyBlendShapeLinks below).
 //   - World ("vrc_blender_helper_world_setup"): the scene's VRC Scene
 //     Descriptor's Spawns array, a Light Probe Group built from LightProbe_*
 //     marker positions, VRCStation components on Station_* objects,
@@ -48,6 +51,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using UnityEditor;
+using UnityEditor.Animations;
 using UnityEngine;
 
 namespace VrcBlenderHelper
@@ -61,8 +65,16 @@ namespace VrcBlenderHelper
         // needs these two to route a sidecar to Apply vs ApplyWorld.
         internal const string SetupFormat = "vrc_blender_helper_setup";
         internal const string WorldSetupFormat = "vrc_blender_helper_world_setup";
-        const int SupportedFormatVersion = 1;
+        const int SupportedFormatVersion = 2;
         const int SupportedWorldFormatVersion = 2;
+
+        // Where ApplyBlendShapeLinks puts generated clips/controllers,
+        // relative to the sidecar's own folder -- keeps auto-produced
+        // sub-assets visually separate from the model/prefab/sidecar that
+        // already live there.
+        const string GeneratedSubfolder = "Generated";
+        const string FxLayerName = "FX";
+        const string BlendShapeLayerName = "VRC Blender Helper";
 
         const string PhysBoneType = "VRC.SDK3.Dynamics.PhysBone.Components.VRCPhysBone";
         const string ContactSenderType = "VRC.SDK3.Dynamics.Contact.Components.VRCContactSender";
@@ -106,6 +118,8 @@ namespace VrcBlenderHelper
             public string receiver_type;
             public string parameter;
             public bool allow_self, allow_others;
+            public string blendshape_mesh;
+            public string blendshape_key;
         }
 
         [Serializable]
@@ -272,6 +286,7 @@ namespace VrcBlenderHelper
             ApplyPhysBones(avatarRoot.transform, armatureNode, setup.physbones, report);
             ApplyContacts(avatarRoot.transform, setup.contacts, report);
             ApplyViewPosition(avatarRoot, armatureNode, setup.view_position, report);
+            ApplyBlendShapeLinks(avatarRoot, Path.GetDirectoryName(jsonPath), setup.contacts, report);
 
             Undo.CollapseUndoOperations(undoGroup);
             return report;
@@ -400,6 +415,165 @@ namespace VrcBlenderHelper
             SetVector3(so, "ViewPosition", viewPosition, "Avatar Descriptor", report);
             so.ApplyModifiedProperties();
             report.Applied.Add($"View Position set to {viewPosition.ToString("F4")} ({vp.method})");
+        }
+
+        /// <summary>
+        /// For every Contact Receiver linked to a shape key in Blender
+        /// (ContactEntry.blendshape_mesh/blendshape_key both set), generates
+        /// a constant-100 AnimationClip for that shape key and wires it into
+        /// a <b>Direct Blend Tree</b> on the avatar's FX layer, with that
+        /// child's Direct Blend Parameter set to the Contact's own
+        /// `parameter` -- VRChat's standard way to let several independent
+        /// Contact-driven effects coexist on one shared layer (confirmed
+        /// against real avatar-tooling usage, not assumed): each child's
+        /// contribution to the final blend shape weight is simply
+        /// 100 * thatParameter, with no interaction between children, since
+        /// Direct blend weights are independent rather than normalized
+        /// against each other the way a normal 1D/2D blend tree's are.
+        ///
+        /// (`AnimatorState.timeParameterActive`/`.timeParameter` -- "Motion
+        /// Time" -- is a real Unity feature but the wrong tool here: it
+        /// scrubs ONE state's clip by a parameter, which only works for a
+        /// single always-active effect per layer. Multiple independent
+        /// Contact-driven effects need Direct Blend Tree's per-child
+        /// parameter instead.)
+        ///
+        /// `AnimatorController`/`AnimationClip`/`BlendTree` are plain built-in
+        /// Unity Editor types (no reflection needed); only finding the FX
+        /// slot on the VRCAvatarDescriptor needs the SDK-reflection
+        /// treatment the rest of this file already uses, resolving the FX
+        /// layer by matching baseAnimationLayers[i].type's enum NAME
+        /// ("FX") rather than ever referencing the actual AnimLayerType
+        /// enum -- so this file keeps compiling without the SDK installed.
+        /// </summary>
+        static void ApplyBlendShapeLinks(GameObject avatarRoot, string fbxFolderPath, ContactEntry[] contacts, Report report)
+        {
+            var links = contacts?.Where(e => !string.IsNullOrEmpty(e.blendshape_mesh) && !string.IsNullOrEmpty(e.blendshape_key)).ToArray();
+            if (links == null || links.Length == 0) return;
+
+            var descriptorType = FindType(AvatarDescriptorType);
+            var descriptor = descriptorType != null ? avatarRoot.GetComponent(descriptorType) : null;
+            if (descriptor == null)
+            {
+                report.Warnings.Add("No VRC Avatar Descriptor on the selected object -- add one and re-run to wire up blend shape links.");
+                return;
+            }
+
+            var so = new SerializedObject(descriptor);
+            var baseLayers = so.FindProperty("baseAnimationLayers");
+            if (baseLayers == null)
+            {
+                report.Warnings.Add("Avatar Descriptor: SDK field 'baseAnimationLayers' not found (SDK changed?) -- skipped blend shape links.");
+                return;
+            }
+
+            SerializedProperty fxElement = null;
+            for (int i = 0; i < baseLayers.arraySize; i++)
+            {
+                var element = baseLayers.GetArrayElementAtIndex(i);
+                var typeProp = element.FindPropertyRelative("type");
+                var names = typeProp?.enumNames;
+                if (names != null && typeProp.enumValueIndex >= 0 && typeProp.enumValueIndex < names.Length
+                    && names[typeProp.enumValueIndex] == FxLayerName)
+                {
+                    fxElement = element;
+                    break;
+                }
+            }
+            if (fxElement == null)
+            {
+                report.Warnings.Add("Avatar Descriptor: couldn't find the FX playable layer slot -- skipped blend shape links.");
+                return;
+            }
+
+            var animatorProp = fxElement.FindPropertyRelative("animatorController");
+            var controller = animatorProp.objectReferenceValue as AnimatorController;
+            if (controller == null)
+            {
+                var controllerPath = GeneratedAssetPath(fbxFolderPath, avatarRoot.name + "_FX.controller");
+                controller = AnimatorController.CreateAnimatorControllerAtPath(controllerPath);
+                animatorProp.objectReferenceValue = controller;
+                so.ApplyModifiedProperties();
+            }
+
+            var layer = controller.layers.FirstOrDefault(l => l.name == BlendShapeLayerName);
+            if (layer.stateMachine == null)
+            {
+                controller.AddLayer(BlendShapeLayerName);
+                layer = controller.layers.First(l => l.name == BlendShapeLayerName);
+            }
+
+            const string stateName = "Blend Shape Links";
+            var state = layer.stateMachine.states.Select(s => s.state).FirstOrDefault(s => s.name == stateName);
+            if (state == null) state = layer.stateMachine.AddState(stateName);
+            var tree = state.motion as BlendTree;
+            if (tree == null)
+            {
+                tree = new BlendTree { name = stateName, blendType = BlendTreeType.Direct };
+                AssetDatabase.AddObjectToAsset(tree, controller);
+                state.motion = tree;
+            }
+
+            bool changedAnyAsset = false;
+            foreach (var e in links)
+            {
+                var target = FindUnique(avatarRoot.transform, e.blendshape_mesh, null, report);
+                if (target == null) continue;
+                var smr = target.GetComponent<SkinnedMeshRenderer>();
+                if (smr == null || smr.sharedMesh == null || smr.sharedMesh.GetBlendShapeIndex(e.blendshape_key) < 0)
+                {
+                    report.Warnings.Add(
+                        $"Contact '{e.@object}': shape key '{e.blendshape_key}' not found on '{e.blendshape_mesh}' -- "
+                        + "skipped (name mismatch between Blender and the imported mesh?).");
+                    continue;
+                }
+
+                if (!controller.parameters.Any(p => p.name == e.parameter))
+                    controller.AddParameter(e.parameter, AnimatorControllerParameterType.Float);
+
+                var clipPath = Path.Combine(fbxFolderPath, GeneratedSubfolder, $"{e.parameter}_{e.blendshape_key}.anim").Replace('\\', '/');
+                var clip = AssetDatabase.LoadAssetAtPath<AnimationClip>(clipPath);
+                if (clip == null)
+                {
+                    clip = new AnimationClip { name = Path.GetFileNameWithoutExtension(clipPath) };
+                    Directory.CreateDirectory(Path.GetDirectoryName(clipPath));
+                    AssetDatabase.CreateAsset(clip, clipPath);
+                }
+                var relativePath = AnimationUtility.CalculateTransformPath(target, avatarRoot.transform);
+                clip.SetCurve(relativePath, typeof(SkinnedMeshRenderer), "blendShape." + e.blendshape_key, new AnimationCurve(new Keyframe(0f, 100f)));
+                EditorUtility.SetDirty(clip);
+
+                var children = tree.children;
+                int existingIndex = Array.FindIndex(children, c => c.directBlendParameter == e.parameter);
+                var childMotion = new ChildMotion { motion = clip, directBlendParameter = e.parameter, timeScale = 1f };
+                tree.children = existingIndex >= 0
+                    ? children.Select((c, i) => i == existingIndex ? childMotion : c).ToArray()
+                    : children.Append(childMotion).ToArray();
+
+                changedAnyAsset = true;
+                report.Applied.Add(
+                    $"Contact '{e.@object}': shape key '{e.blendshape_key}' on '{e.blendshape_mesh}' wired to FX "
+                    + $"parameter '{e.parameter}' via a Direct Blend Tree.");
+                if (!e.local_only)
+                    report.Warnings.Add(
+                        $"Contact '{e.@object}': parameter '{e.parameter}' is not Local Only -- add it to your "
+                        + "VRC Expression Parameters by hand so it syncs to other players.");
+            }
+
+            if (changedAnyAsset)
+            {
+                EditorUtility.SetDirty(controller);
+                AssetDatabase.SaveAssets();
+            }
+        }
+
+        /// <summary>folderPath/Generated/fileName, creating the Generated
+        /// subfolder if needed.</summary>
+        static string GeneratedAssetPath(string folderPath, string fileName)
+        {
+            var dir = Path.Combine(folderPath, GeneratedSubfolder).Replace('\\', '/');
+            Directory.CreateDirectory(dir);
+            return $"{dir}/{fileName}";
         }
 
         // -- Apply (world) --

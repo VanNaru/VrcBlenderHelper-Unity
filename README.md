@@ -11,6 +11,13 @@ Avatar sidecar:
 - **VRCPhysBone** on every bone you marked as a PhysBone root, with your settings
 - **VRCContactSender / VRCContactReceiver** on every `Contact_*` object
 - **View Position** on the VRC Avatar Descriptor (from the eye bones)
+- For any Contact Receiver you linked to a shape key in Blender: a generated
+  AnimationClip wired into a **Direct Blend Tree** on the FX layer (added/reused
+  automatically), so that Receiver's parameter directly drives the shape key's
+  weight (0-100) -- VRChat's standard way to let several independent touch
+  effects coexist on one layer. If that Receiver isn't Local Only, add its
+  parameter to your **VRC Expression Parameters** by hand so it syncs to other
+  players -- this package deliberately doesn't touch that asset.
 
 World sidecar:
 - **Spawns** on the scene's VRC Scene Descriptor, from your `Spawn_*` markers
@@ -42,15 +49,16 @@ Worlds SDK for the world side.
    together without picking a folder each time).
 2. **Automatic setup**: importing (or re-importing) that `.fbx` creates/updates
    a same-named `<name>.prefab` right next to it, already carrying everything
-   below except Spawns -- PhysBones, Contacts, View Position*, Stations,
-   Reflection Probes, and Teleporter colliders. Drag **that Prefab** (not the
-   raw `.fbx`) into your scene.
-   - \* View Position only applies once a VRC Avatar Descriptor exists on the
-     Prefab -- add one, then re-import (or run step 3) once to pick it up.
+   below except Spawns -- PhysBones, Contacts, View Position*, blend shape
+   Direct Blend Tree links*, Stations, Reflection Probes, and Teleporter
+   colliders. Drag **that Prefab** (not the raw `.fbx`) into your scene.
+   - \* View Position and blend shape links both need a VRC Avatar Descriptor
+     already on the Prefab to apply -- add one, then re-import (or run step 3)
+     once to pick them up.
 3. Still manual either way:
    - Avatar: add a VRC Avatar Descriptor if you haven't, then re-import or
      run **Tools → VRC Blender Helper → Apply Setup to Selected Avatar** to
-     pick up View Position.
+     pick up View Position and any blend shape links.
    - World: make sure a VRC Scene Descriptor exists somewhere in the scene,
      then run **Tools → VRC Blender Helper → Apply Setup to Selected World
      Root** against the dragged-in Prefab instance for Spawns -- this is the
