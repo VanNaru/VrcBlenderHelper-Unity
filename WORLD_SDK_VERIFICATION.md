@@ -61,3 +61,22 @@ If Debug mode shows no such field on `VRCStation`, that setting in
 dead weight -- either find the real mechanism VRChat uses for seated vs.
 standing stations and point `SetBool`/`SetEnum` at that instead, or drop
 `seated` from both sides of the bridge.
+
+## Reflection Probes and Teleporter colliders: not in scope for this check
+
+`ApplyReflectionProbes` and `ApplyTeleportTargets`/`ApplyTeleportTriggers`
+use `UnityEngine.ReflectionProbe` and `UnityEngine.BoxCollider` -- both core
+engine types, set via direct C# properties (`probe.size`, `collider.isTrigger`,
+etc.), not `FindType`/`SerializedObject` reflection the way the VRC SDK types
+above are. There is no VRChat SDK version to verify these against, the same
+reason `LightProbeGroup` (used by `ApplyLightProbes`) was never in this
+table either -- their property names come straight from Unity's own
+ScriptReference and don't depend on anything VRChat ships or can rename.
+
+What IS still a real open question for the teleporter side: this package
+deliberately does not add any Udon/UdonSharp behaviour, so `TeleportTrigger`
+objects only get a correctly sized/trigger-configured `BoxCollider` -- actual
+teleportation still needs a hand-written `UdonBehaviour` calling
+`Networking.LocalPlayer.TeleportTo(...)`, exactly as the Console message each
+`ApplyTeleportTriggers` run logs says. That's a scope decision, not an
+unverified field.

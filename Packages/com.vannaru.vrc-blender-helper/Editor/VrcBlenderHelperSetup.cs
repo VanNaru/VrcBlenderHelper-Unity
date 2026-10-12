@@ -9,13 +9,22 @@
 //     Contact_* objects, and the Avatar Descriptor's View Position.
 //   - World ("vrc_blender_helper_world_setup"): the scene's VRC Scene
 //     Descriptor's Spawns array, a Light Probe Group built from LightProbe_*
-//     marker positions, and VRCStation components on Station_* objects.
+//     marker positions, VRCStation components on Station_* objects,
+//     UnityEngine.ReflectionProbe components on ReflectionProbe_* objects,
+//     and a BoxCollider on every TeleportTarget_*/TeleportTrigger_* object
+//     (sized/trigger-configured, but NOT wired to any teleport behavior --
+//     see ApplyTeleportTriggers below for what's still a manual Udon step).
 //
 // Install: add the VPM listing in ALCOM/VCC and install "VRC Blender Helper"
 //          (see README), or copy this file into any "Editor" folder under Assets/.
-// Use:     select the avatar (or imported world) root in the Hierarchy, then
-//          Tools > VRC Blender Helper > Apply Setup to Selected Avatar, or
-//          Tools > VRC Blender Helper > Apply Setup to Selected World Root.
+// Use:     VrcBlenderHelperImporter.cs (same folder) already runs most of this
+//          automatically into a generated Prefab Variant on import -- see its
+//          own header comment. The menu items below are the manual fallback,
+//          and still the only way to apply a world's Spawns (needs a
+//          VRCSceneDescriptor placed in a scene, which can't exist at import
+//          time): select the avatar (or imported world) root in the
+//          Hierarchy, then Tools > VRC Blender Helper > Apply Setup to
+//          Selected Avatar, or ...Apply Setup to Selected World Root.
 //
 // Re-running is safe: existing components on the same objects are updated
 // in place, not duplicated, and everything is undoable as one step.
@@ -48,10 +57,12 @@ namespace VrcBlenderHelper
         const string AvatarMenuPath = "Tools/VRC Blender Helper/Apply Setup to Selected Avatar";
         const string WorldMenuPath = "Tools/VRC Blender Helper/Apply Setup to Selected World Root";
         const string SidecarSuffix = ".vrchelper.json";
-        const string SetupFormat = "vrc_blender_helper_setup";
-        const string WorldSetupFormat = "vrc_blender_helper_world_setup";
+        // internal, not private: VrcBlenderHelperImporter.cs (same assembly)
+        // needs these two to route a sidecar to Apply vs ApplyWorld.
+        internal const string SetupFormat = "vrc_blender_helper_setup";
+        internal const string WorldSetupFormat = "vrc_blender_helper_world_setup";
         const int SupportedFormatVersion = 1;
-        const int SupportedWorldFormatVersion = 1;
+        const int SupportedWorldFormatVersion = 2;
 
         const string PhysBoneType = "VRC.SDK3.Dynamics.PhysBone.Components.VRCPhysBone";
         const string ContactSenderType = "VRC.SDK3.Dynamics.Contact.Components.VRCContactSender";
@@ -128,6 +139,30 @@ namespace VrcBlenderHelper
         }
 
         [Serializable]
+        class ReflectionProbeEntry
+        {
+            public string @object;
+            public string probe_type;
+            public float[] box_size;
+            public float[] box_offset;
+            public bool box_projection;
+            public int importance;
+            public float intensity;
+            public int resolution;
+            public bool hdr;
+        }
+
+        [Serializable]
+        class TeleportTriggerEntry
+        {
+            public string @object;
+            public string target;
+            public string trigger_mode;
+            public string orientation;
+            public float[] box_size;
+        }
+
+        [Serializable]
         class WorldSetup
         {
             public string format;
@@ -136,6 +171,9 @@ namespace VrcBlenderHelper
             public string[] spawns;
             public string[] light_probes;
             public StationEntry[] stations;
+            public ReflectionProbeEntry[] reflection_probes;
+            public string[] teleport_targets;
+            public TeleportTriggerEntry[] teleport_triggers;
         }
 
         public class Report
@@ -186,9 +224,21 @@ namespace VrcBlenderHelper
         {
             var source = PrefabUtility.GetCorrespondingObjectFromOriginalSource(avatarRoot);
             var assetPath = source != null ? AssetDatabase.GetAssetPath(source) : null;
-            if (string.IsNullOrEmpty(assetPath) || !assetPath.EndsWith(".fbx", StringComparison.OrdinalIgnoreCase))
+            return assetPath != null ? SidecarPathForAsset(assetPath) : null;
+        }
+
+        /// <summary>
+        /// '.../Avatar.fbx' -> '.../Avatar.vrchelper.json' if that file
+        /// actually exists, else null -- same rule FindSidecar above uses,
+        /// exposed standalone (keyed off a plain asset path instead of a
+        /// scene instance) for VrcBlenderHelperImporter.cs's import-time
+        /// hook, which has no scene instance to work backward from yet.
+        /// </summary>
+        public static string SidecarPathForAsset(string fbxAssetPath)
+        {
+            if (string.IsNullOrEmpty(fbxAssetPath) || !fbxAssetPath.EndsWith(".fbx", StringComparison.OrdinalIgnoreCase))
                 return null;
-            var candidate = assetPath.Substring(0, assetPath.Length - 4) + SidecarSuffix;
+            var candidate = fbxAssetPath.Substring(0, fbxAssetPath.Length - 4) + SidecarSuffix;
             return File.Exists(candidate) ? candidate : null;
         }
 
@@ -392,6 +442,9 @@ namespace VrcBlenderHelper
             ApplySpawns(root, setup.spawns, report);
             ApplyLightProbes(root, setup.light_probes, report);
             ApplyStations(root, setup.stations, report);
+            ApplyReflectionProbes(root, setup.reflection_probes, report);
+            ApplyTeleportTargets(root, setup.teleport_targets, report);
+            ApplyTeleportTriggers(root, setup.teleport_triggers, report);
 
             Undo.CollapseUndoOperations(undoGroup);
             return report;
@@ -503,6 +556,127 @@ namespace VrcBlenderHelper
             }
         }
 
+        /// <summary>
+        /// UnityEngine.ReflectionProbe is a core engine type (always present,
+        /// unlike the VRC SDK types above), so it's referenced directly
+        /// rather than through FindType/SerializedObject reflection -- same
+        /// treatment ApplyLightProbes gives LightProbeGroup.
+        ///
+        /// Unlike most components, ReflectionProbe.size/center are
+        /// documented as world-space values, NOT scaled by the GameObject's
+        /// own Transform -- and box_size/box_offset arrive from Blender
+        /// already in world meters, deliberately NOT multiplied by the
+        /// marker's own object scale (core/unity_bridge.py's
+        /// _reflection_probes_payload ignores it on purpose, since that
+        /// scale is only ever a Blender-viewport preview aid -- see
+        /// core/reflection_probes.py's size_marker_cube). So these two facts
+        /// cancel out perfectly: set size/center directly, with no scale
+        /// division at all.
+        /// </summary>
+        static void ApplyReflectionProbes(Transform importRoot, ReflectionProbeEntry[] entries, Report report)
+        {
+            if (entries == null || entries.Length == 0) return;
+
+            foreach (var e in entries)
+            {
+                var target = FindUnique(importRoot, e.@object, null, report);
+                if (target == null) continue;
+
+                var probe = target.gameObject.GetComponent<ReflectionProbe>();
+                bool added = probe == null;
+                if (added) probe = Undo.AddComponent<ReflectionProbe>(target.gameObject);
+                Undo.RecordObject(probe, "Set ReflectionProbe settings");
+
+                probe.size = ToVector3(e.box_size);
+                probe.center = ToVector3(e.box_offset);
+                probe.boxProjection = e.box_projection;
+                probe.importance = e.importance;
+                probe.intensity = e.intensity;
+                probe.resolution = e.resolution;
+                probe.hdr = e.hdr;
+                probe.mode = ParseReflectionProbeMode(e.probe_type);
+
+                report.Applied.Add($"ReflectionProbe '{e.@object}': {(added ? "added" : "updated")} ({e.probe_type}, {probe.size})");
+            }
+        }
+
+        /// <summary>
+        /// Gives each TeleportTarget_* object a BoxCollider, matching
+        /// creators.vrchat.com's own Udon Basics example, which explicitly
+        /// requires a Collider on TeleportTo's target GameObject. Default
+        /// BoxCollider size (1,1,1 local) -- Blender has no size data for a
+        /// bare target marker to carry over, so this is a starting point to
+        /// resize by hand if the default footprint doesn't fit.
+        /// </summary>
+        static void ApplyTeleportTargets(Transform importRoot, string[] targetNames, Report report)
+        {
+            if (targetNames == null || targetNames.Length == 0) return;
+
+            foreach (var name in targetNames)
+            {
+                var target = FindUnique(importRoot, name, null, report);
+                if (target == null) continue;
+
+                var collider = target.gameObject.GetComponent<BoxCollider>();
+                bool added = collider == null;
+                if (added)
+                {
+                    collider = Undo.AddComponent<BoxCollider>(target.gameObject);
+                    collider.isTrigger = false;
+                }
+                report.Applied.Add($"TeleportTarget '{name}': BoxCollider {(added ? "added" : "left as-is")}");
+            }
+        }
+
+        /// <summary>
+        /// Gives each TeleportTrigger_* object a BoxCollider sized/trigger-
+        /// configured for its mode, but does NOT add any Udon/UdonSharp
+        /// script -- this bridge prepares scene geometry and stock SDK/
+        /// engine components, the same division of labor Stations and
+        /// Contacts already use; it does not author gameplay logic. The
+        /// Applied log line spells out the exact call to wire up by hand.
+        ///
+        /// BoxCollider.size IS scaled by the object's own Transform
+        /// (unlike ReflectionProbe.size above), so box_size -- world
+        /// meters, independent of the marker's own preview scale, same
+        /// reasoning as ApplyReflectionProbes -- is divided by this
+        /// object's lossyScale per axis to cancel that back out and land
+        /// on the correct real-world collision volume.
+        /// </summary>
+        static void ApplyTeleportTriggers(Transform importRoot, TeleportTriggerEntry[] entries, Report report)
+        {
+            if (entries == null || entries.Length == 0) return;
+
+            foreach (var e in entries)
+            {
+                var trigger = FindUnique(importRoot, e.@object, null, report);
+                if (trigger == null) continue;
+
+                var collider = trigger.gameObject.GetComponent<BoxCollider>();
+                bool added = collider == null;
+                if (added) collider = Undo.AddComponent<BoxCollider>(trigger.gameObject);
+                Undo.RecordObject(collider, "Set TeleportTrigger BoxCollider");
+
+                bool walkIn = Normalize(e.trigger_mode) == "walkin";
+                collider.size = DivideSafe(ToVector3(e.box_size), trigger.lossyScale);
+                collider.center = Vector3.zero;
+                collider.isTrigger = walkIn;
+
+                if (string.IsNullOrEmpty(e.target))
+                    report.Warnings.Add($"TeleportTrigger '{e.@object}': no target set in Blender -- nothing to teleport to yet.");
+                else if (FindUnique(importRoot, e.target, null, report, warnIfMissing: false) == null)
+                    report.Warnings.Add($"TeleportTrigger '{e.@object}': target '{e.target}' not found under {importRoot.name}.");
+
+                string eventName = walkIn ? "OnPlayerTriggerEnter" : "Interact()";
+                report.Applied.Add(
+                    $"TeleportTrigger '{e.@object}': BoxCollider {(added ? "added" : "updated")} " +
+                    $"({(walkIn ? "Walk In, trigger" : "Interact, solid")}) -- add an UdonBehaviour that calls " +
+                    $"Networking.LocalPlayer.TeleportTo(target.position, target.rotation, " +
+                    $"VRC_SceneDescriptor.SpawnOrientation.{SpawnOrientationName(e.orientation)}) targeting " +
+                    $"'{e.target}' from {eventName}. Not wired automatically.");
+            }
+        }
+
         // -- Helpers --
 
         static Type FindType(string fullName) =>
@@ -555,6 +729,39 @@ namespace VrcBlenderHelper
         static float MaxComponent(Vector3 v) => Mathf.Max(Mathf.Abs(v.x), Mathf.Abs(v.y), Mathf.Abs(v.z));
 
         static string Normalize(string s) => (s ?? "").Replace("_", "").Replace(" ", "").ToLowerInvariant();
+
+        static Vector3 ToVector3(float[] arr) =>
+            arr != null && arr.Length >= 3 ? new Vector3(arr[0], arr[1], arr[2]) : Vector3.zero;
+
+        /// <summary>Component-wise a/b, falling back to `a` on a near-zero
+        /// denominator component (mirrors LocalScaleFactor's epsilon guard)
+        /// rather than dividing by zero.</summary>
+        static Vector3 DivideSafe(Vector3 a, Vector3 b) => new Vector3(
+            Mathf.Abs(b.x) > 1e-6f ? a.x / b.x : a.x,
+            Mathf.Abs(b.y) > 1e-6f ? a.y / b.y : a.y,
+            Mathf.Abs(b.z) > 1e-6f ? a.z / b.z : a.z);
+
+        static UnityEngine.Rendering.ReflectionProbeMode ParseReflectionProbeMode(string probeType)
+        {
+            switch (Normalize(probeType))
+            {
+                case "realtime": return UnityEngine.Rendering.ReflectionProbeMode.Realtime;
+                case "custom": return UnityEngine.Rendering.ReflectionProbeMode.Custom;
+                default: return UnityEngine.Rendering.ReflectionProbeMode.Baked;
+            }
+        }
+
+        /// <summary>Blender's DEFAULT/ALIGN_PLAYER/ALIGN_ROOM onto VRC_SceneDescriptor.SpawnOrientation's
+        /// real enum member names, for the log message in ApplyTeleportTriggers only.</summary>
+        static string SpawnOrientationName(string orientation)
+        {
+            switch (Normalize(orientation))
+            {
+                case "alignplayer": return "AlignPlayerWithSpawnPoint";
+                case "alignroom": return "AlignRoomWithSpawnPoint";
+                default: return "Default";
+            }
+        }
 
         static SerializedProperty Prop(SerializedObject so, string name, string ctx, Report report)
         {
